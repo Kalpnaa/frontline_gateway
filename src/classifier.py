@@ -26,6 +26,14 @@ from constants import (
 )
 from schema import CustomerMessage, TriageResult
 
+
+# ---------------------------------------------------------------------------
+# Custom exception — lets callers detect rate-limit failures specifically
+# ---------------------------------------------------------------------------
+
+class GroqRateLimitError(RuntimeError):
+    """Raised when Groq returns HTTP 429 (tokens-per-minute exceeded)."""
+
 # ---------------------------------------------------------------------------
 # Load .env and initialise the Groq client once at import time.
 # ---------------------------------------------------------------------------
@@ -108,7 +116,9 @@ def classify(message: CustomerMessage) -> tuple[TriageResult, str, float, float]
             response_format={"type": "json_object"},
         )
     except RateLimitError as exc:
-        raise RuntimeError(
+        # Re-raise as a named exception so the evaluator retry wrapper
+        # can distinguish rate-limit failures from other errors.
+        raise GroqRateLimitError(
             "Groq rate limit reached. Wait a moment and try again."
         ) from exc
     except APIConnectionError as exc:
@@ -170,6 +180,22 @@ def classify(message: CustomerMessage) -> tuple[TriageResult, str, float, float]
 
     # --- 4. Validate with Pydantic --------------------------------------
     try:
+        # If the original message is too short/meaningless, force a safe summary
+        # regardless of what the model invented.
+        if len(message.text.strip()) < 10 or not any(c.isalpha() for c in message.text):
+            data["summary"] = "No meaningful message provided."
+            data["category"] = "out_of_scope"
+            data["priority"] = "P3"
+            data["needs_human"] = False
+            data["confidence"] = 0.1
+            data["suggested_actions"] = ["Ask customer to describe their issue"]
+
+        # Repair malformed fields before validation
+        if not data.get("summary") or len(data["summary"].strip()) < 5:
+            data["summary"] = "Insufficient issue details provided."
+
+        if not data.get("suggested_actions"):
+            data["suggested_actions"] = ["Escalate to human support"]
         result = TriageResult(**data)
     except Exception as exc:
         raise ValueError(

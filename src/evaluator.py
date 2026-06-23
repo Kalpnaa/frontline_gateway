@@ -23,6 +23,16 @@ from schema import Category, Priority
 
 import time
 
+from classifier import GroqRateLimitError
+
+# ---------------------------------------------------------------------------
+# Retry / rate-limit config
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES         = 3           # attempts per row before giving up
+BACKOFF_SECONDS     = [2, 5, 10]  # wait times between consecutive retries
+INTER_REQUEST_DELAY = 0.8         # seconds to sleep between every row call
+
 
 # ---------------------------------------------------------------------------
 # Test case definition
@@ -75,6 +85,34 @@ class EvalResults:
         print(f"{'='*50}\n")
 
 
+# ---------------------------------------------------------------------------
+# Retry wrapper
+# ---------------------------------------------------------------------------
+
+def _triage_with_retry(message: str):
+    """
+    Call run_triage with exponential backoff on Groq 429 errors.
+
+    Retries up to MAX_RETRIES times. Only rate-limit errors trigger a retry;
+    all other exceptions propagate immediately so the evaluator can count them.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return run_triage(message)
+        except GroqRateLimitError as exc:
+            last_exc = exc
+            wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+            print(
+                f"  ⚠  Rate limit hit (attempt {attempt + 1}/{MAX_RETRIES}). "
+                f"Retrying in {wait}s…"
+            )
+            time.sleep(wait)
+        # Non-rate-limit errors bubble up immediately
+    raise last_exc  # all retries exhausted
+
+
 def run_eval():
     df = pd.read_csv(DATASET_PATH)
 
@@ -86,68 +124,82 @@ def run_eval():
     total_cost = 0
     failures = []
     errors = 0
+    llm_calls = 0
 
-    for _, row in df.iterrows():
-        try:
-            result, latency_ms, cost_usd = run_triage(row["message"])
+    try:
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):   # sequential
+            print(f"  [{idx:>2}/{total}] Processing…", end="\r", flush=True)
+            try:
+                result, latency_ms, cost_usd = _triage_with_retry(row["message"])
 
-            total_latency += latency_ms
-            total_cost += cost_usd
+                if latency_ms > 0:
+                    total_latency += latency_ms
+                    llm_calls += 1
+                total_cost += cost_usd
 
-            predicted_category = result.category.value
-            predicted_priority = result.priority.value
-            predicted_human = result.needs_human
+                predicted_category = result.category.value
+                predicted_priority = result.priority.value
+                predicted_human = result.needs_human
 
-            expected_category = row["category"]
-            expected_priority = row["priority"]
-            expected_human = str(row["expected_needs_human"]).lower() == "true"
+                expected_category = row["category"]
+                expected_priority = row["priority"]
+                expected_human = str(row["expected_needs_human"]).lower() == "true"
 
-            if predicted_category == expected_category:
-                category_correct += 1
+                if predicted_category == expected_category:
+                    category_correct += 1
 
-            if predicted_priority == expected_priority:
-                priority_correct += 1
+                if predicted_priority == expected_priority:
+                    priority_correct += 1
 
-            if predicted_human == expected_human:
-                human_correct += 1
+                if predicted_human == expected_human:
+                    human_correct += 1
 
-            if (
-                predicted_category != expected_category
-                or predicted_priority != expected_priority
-            ):
-                failures.append({
-                    "message": row["message"],
-                    "expected_category": expected_category,
-                    "predicted_category": predicted_category,
-                    "expected_priority": expected_priority,
-                    "predicted_priority": predicted_priority,
-                })
+                if (
+                    predicted_category != expected_category
+                    or predicted_priority != expected_priority
+                ):
+                    failures.append({
+                        "message": row["message"],
+                        "expected_category": expected_category,
+                        "predicted_category": predicted_category,
+                        "expected_priority": expected_priority,
+                        "predicted_priority": predicted_priority,
+                    })
 
-        except Exception as e:
-            errors += 1
-            print(f"Error: {e}")
+            except Exception as e:
+                errors += 1
+                print(f"\n  ✗  Row {idx} failed after retries: {e}")
 
-    print("\n" + "=" * 60)
-    print("EVALUATION REPORT")
-    print("=" * 60)
-    print(f"Total Samples         : {total}")
-    print(f"Category Accuracy     : {(category_correct/total)*100:.2f}%")
-    print(f"Priority Accuracy     : {(priority_correct/total)*100:.2f}%")
-    print(f"Human Escalation Acc  : {(human_correct/total)*100:.2f}%")
-    print(f"Average Latency       : {total_latency/total:.2f} ms")
-    print(f"Estimated Total Cost  : ${total_cost:.6f}")
-    print(f"Errors                : {errors}")
+            # Small delay between every request to avoid TPM bursts
+            time.sleep(INTER_REQUEST_DELAY)
 
-    if failures:
-        print("\nFAILURE ANALYSIS")
+    finally:
+        # Always print the report — even if the loop is interrupted
+        processed = category_correct + priority_correct + errors  # noqa: rough
+        safe_total = max(total, 1)
+        safe_llm_calls = max(llm_calls, 1)
+
+        print("\n" + "=" * 60)
+        print("EVALUATION REPORT")
         print("=" * 60)
-        for i, fail in enumerate(failures[:5], start=1):
-            print(f"\nCase #{i}")
-            print(f"Message            : {fail['message']}")
-            print(f"Expected Category  : {fail['expected_category']}")
-            print(f"Predicted Category : {fail['predicted_category']}")
-            print(f"Expected Priority  : {fail['expected_priority']}")
-            print(f"Predicted Priority : {fail['predicted_priority']}")
+        print(f"Total Samples         : {total}")
+        print(f"Category Accuracy     : {(category_correct/safe_total)*100:.2f}%")
+        print(f"Priority Accuracy     : {(priority_correct/safe_total)*100:.2f}%")
+        print(f"Human Escalation Acc  : {(human_correct/safe_total)*100:.2f}%")
+        print(f"Average Latency       : {total_latency/safe_llm_calls:.2f} ms  (LLM calls only)")
+        print(f"Estimated Total Cost  : ${total_cost/safe_llm_calls:.6f}")
+        print(f"Errors                : {errors}")
+
+        if failures:
+            print("\nFAILURE ANALYSIS")
+            print("=" * 60)
+            for i, fail in enumerate(failures[:5], start=1):
+                print(f"\nCase #{i}")
+                print(f"Message            : {fail['message']}")
+                print(f"Expected Category  : {fail['expected_category']}")
+                print(f"Predicted Category : {fail['predicted_category']}")
+                print(f"Expected Priority  : {fail['expected_priority']}")
+                print(f"Predicted Priority : {fail['predicted_priority']}")
 
 # ---------------------------------------------------------------------------
 # Run directly

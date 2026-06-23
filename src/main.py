@@ -40,10 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     source = parser.add_mutually_exclusive_group()
-    parser.add_argument("--eval", action="store_true")
     source.add_argument("--message", "-m", type=str, help="Customer message as a string.")
     source.add_argument("--file",    "-f", type=str, help="Path to a .txt file containing the message.")
-    source.add_argument("--eval",    action="store_true", help="Run the built-in evaluator.")
     parser.add_argument("--save",    "-s", action="store_true", help="Save result as JSON in data/.")
     parser.add_argument("--json-only", action="store_true", help="Print raw JSON only (pipe-friendly).")
     return parser
@@ -67,11 +65,6 @@ def triage_and_display(message: str, save: bool, json_only: bool) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print_result(result, message=message, latency_ms=latency_ms, cost_usd=cost_usd)
-
-    if eval:
-        from evaluator import run_eval
-        run_eval()
-        return
 
     if save:
         path = save_result(result, latency_ms=latency_ms, cost_usd=cost_usd)
@@ -107,11 +100,6 @@ def main() -> int:
     parser = build_parser()
     args   = parser.parse_args()
 
-    if args.eval:
-        from evaluator import run_eval
-        results = run_eval()
-        results.print_summary()
-        return 0
 
     if args.message:
         return triage_and_display(args.message, args.save, args.json_only)
